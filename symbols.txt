@@ -1,0 +1,21 @@
+libc++_shared.so SHA256 3085a29268980b9e898ffafc0655fa51d5cdb51c3142e99fcc57be4d2d9d6a28
+NEEDED ['libc.so', 'libdl.so']
+libffmpeg.so SHA256 5de90ece1c5ddc3d06cf056c2d0e48c2eda6d9d3c824f7a308c7e972932677d9
+NEEDED ['libm.so', 'libz.so', 'libc++_shared.so', 'libdl.so', 'libc.so']
+kvc30dec_post_process VA=0x4d7790 size=12 section=14
+kvc30dec_unref_frame VA=0x4d779c size=12 section=14
+kvc30dec_get_version VA=0x4d7fd8 size=12 section=14
+kvc30dec_free_decode_memory VA=0x4d7930 size=52 section=14
+ff_kvc_parser VA=0x9c19d0 size=56 section=22
+ff_libkvc30_decoder VA=0x9c1ec8 size=232 section=22
+kvc30dec_destroy VA=0x4d7758 size=44 section=14
+kvc30dec_get_double VA=0x4d7f6c size=108 section=14
+kvc30dec_export_params VA=0x4d77a8 size=8 section=14
+kvc30dec_alloc_decode_memory VA=0x4d77b0 size=384 section=14
+kvc30dec_set_double VA=0x4d7edc size=144 section=14
+kvc30dec_get_pointer VA=0x4d7a84 size=148 section=14
+kvc30dec_set_pointer VA=0x4d7964 size=288 section=14
+kvc30dec_get_integer VA=0x4d7364 size=1012 section=14
+kvc30dec_decode VA=0x4d7784 size=12 section=14
+kvc30dec_set_integer VA=0x4d7b18 size=964 section=14
+kvc30dec_create VA=0x4d7094 size=720 section=14

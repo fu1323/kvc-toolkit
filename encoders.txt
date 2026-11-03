@@ -1,0 +1,8 @@
+ENCODER mjpeg codec_id=7
+ENCODER png codec_id=61
+ENCODER rawvideo codec_id=13
+ENCODER libfdk_aac codec_id=86018
+ENCODER libopus codec_id=86076
+ENCODER libk264 codec_id=27
+ENCODER libkrtc265 codec_id=173
+KVC7 encoder pointer=0

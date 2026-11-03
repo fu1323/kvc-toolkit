@@ -1,0 +1,4 @@
+1084 frames, 1280x720, 36.066666 seconds.
+Standalone decode+YUV write: 10.774 seconds.
+End-to-end unidbg + libx264 CRF18 + audio copy: 18.07 seconds.
+Decoded output frame hashes and timestamps match earlier phone-bridge output: True
