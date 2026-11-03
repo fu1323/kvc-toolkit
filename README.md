@@ -1114,16 +1114,14 @@ RPC 控制接口 + 适合大量帧的数据传输通道
 
 本文没有提供新的可执行转码管道，也没有修改 Java、Python、C 外壳或原始 `.so`。所有代码片段和架构图都用于解释原理；实际实施前仍需确定协议、时间线、缓冲容量和进程管理细节。
 
-## 格式映射表里有 5 个 KVC 标记
-
-  
-   |视频格式标记| 这份库中的 codec ID|
-    |---|---|
-   |kvc2|0x30001|
-   |kvc3|0x30002|
-   |kvc5|0x30004|
-   |kvc6|0x30006|
-   |kvc7|0x30005|
+## 格式映射表里有 5 个 KVC 标记 
+|视频格式标记| 这份库中的 codec ID|
+|---|---|
+|kvc2|0x30001|
+|kvc3|0x30002|
+|kvc5|0x30004|
+|kvc6|0x30006|
+|kvc7|0x30005|
 
 
 ```
@@ -1312,4 +1310,49 @@ avcodec_receive_frame(ctx, fr); // 取出解码画面
 但不是每帧只调用一次就一定有结果：解码器可能需要缓存多个包，也可能一次送包后要多次取帧。输入结束后，还需要送空包，让它吐出缓存的剩余画面。
 
 这 15 种函数不是总调用次数；循环中的函数会反复调用，而且 .so 内部还会进一步执行真正的 KVC 解码函数。
+```
+```
+文件里的 kvLC，大小写要区分。它是 KVC 在 MP4 里的配置块标识，没有证据表明它与 VideoLAN 的 VLC 播放器有关，不能把这四个字符拆成“k + VLC”来理解。VLC 播放器是另一个独立项目。VideoLAN 官方介绍
+
+在你现在的 Java 代码里，配置传递被 libffmpeg.so 内部处理了，所以看不到手动读取 kvLC 的代码。
+
+整体路径可以这样理解：
+MP4 文件
+  ├─ kvc7：标识视频编码类型
+  ├─ kvLC：解码配置数据
+  └─ 视频压缩数据
+          │
+          ▼
+avformat_open_input()
+  解复用器读取 MP4 头、建立视频轨参数
+          │
+          ▼
+AVStream.codecpar
+  包含 codec_id、宽高、extradata 等
+          │
+          ▼
+avcodec_parameters_to_context()
+  把参数和 extradata 复制到解码器上下文
+          │
+          ▼
+avcodec_open2()
+  初始化 libkvc30dec，使其可以使用这些配置
+          │
+          ▼
+avcodec_send_packet() / avcodec_receive_frame()
+  输入压缩包，输出解码帧
+对应你代码最关键的是这两句：
+// 将视频轨参数（包括附加配置数据）交给解码器上下文
+call("avcodec_parameters_to_context", ptr(ctx), par);
+
+// 使用已经设置好的上下文打开解码器
+call("avcodec_open2", ptr(ctx), ptr(dec), 0);
+avcodec_parameters_to_context() 不只是复制宽高：FFmpeg 的实现会为 extradata 分配内存、复制内容，并设置 extradata_size。FFmpeg 源码
+
+这里要区分两个层次：
+- 接口层已经清楚：视频轨配置通过 codecpar → ctx 传入；你无需在 Java 里再单独发送一次配置块。
+- KVC 私有实现尚未逐字节确认：`kvLC` 内容是否原样进入 extradata、中间是否转换，以及底层在 avcodec_open2() 时还是首包到来时完成全部解析，还需要跟踪这份 .so。不能仅凭接口调用就断言它的具体字段布局和解析时机。
+可以把 kvLC 理解为这路压缩视频的“解码说明书”：后面的压缩包是具体内容。它在用途上类似 H.264 的 avcC、HEVC 的 hvcC，但这不代表它们内部格式相同。
+
+所以，使用现在的 libffmpeg.so 解复用再解码，这些工作由库处理；如果以后绕过解复用器，直接调用底层 kvc30dec_*，就必须查清楚这份配置应该如何交给底层解码器。
 ```
