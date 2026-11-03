@@ -11,7 +11,9 @@ import com.github.unidbg.memory.MemoryBlock;
 import com.sun.jna.Pointer;
 
 import java.io.*;
-
+/**
+*  demo 输出原始yuv
+* */
 public class KvcProbe {
     static AndroidEmulator e;
     static Module lib;
