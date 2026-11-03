@@ -1,4 +1,5 @@
-# KVC Toolkit：KVC7 视频解码与转码验证工具
+# KVC Toolkit：KVC7 视频解码 转码分析  Android逆向 媒体逆向
+## 感谢ChatGPT
 
 > 文档更新：2026-11-03。
 >
