@@ -12,10 +12,12 @@ import com.sun.jna.Pointer;
 
 import java.io.*;
 import java.util.Random;
+
 /**
- *转码实现 不写盘yuv 而是pipe交给本机ffmpeg
+ * 转码实现 不写盘yuv 而是pipe交给本机ffmpeg
  *
- * */
+ *
+ */
 
 public class KvcProbe_ffmpeg {
     static AndroidEmulator e;
@@ -38,7 +40,7 @@ public class KvcProbe_ffmpeg {
 //        final File input = new File(args[0]);
         final File input = new File("/Users/fuchunming/Downloads/input.mp4");
         // int limit = args.length > 2 ? Integer.parseInt(args[2]) : 1;  //limit=1 只解一贞 limit=0 完整
-        int limit =0;
+        int limit = 0;
 
         e = AndroidEmulatorBuilder.for64Bit().setProcessName("kvc-probe").setRootDir(new File(System.getProperty("kvc.rootdir", "work/kvc-root")))
                 .addBackendFactory(new DynarmicFactory(true)).addBackendFactory(new Unicorn2Factory(true)).build();
@@ -126,6 +128,7 @@ public class KvcProbe_ffmpeg {
         void writeFrame(long frame, int w, int h) throws IOException {
             Random random = new Random();
             if (process == null) {
+                // 第一帧进来时，先根据 w/h 启动 FFmpeg
                 width = w;
                 height = h;
                 ProcessBuilder pb = new ProcessBuilder(
@@ -143,7 +146,7 @@ public class KvcProbe_ffmpeg {
                         "-preset", "fast",
                         "-c:a", "copy",
                         "-movflags", "+faststart",
-                        "output_"+random.nextInt()+".mp4"
+                        "output_" + random.nextInt() + ".mp4"
                 );
                 pb.redirectError(ProcessBuilder.Redirect.INHERIT);
                 pb.redirectOutput(ProcessBuilder.Redirect.INHERIT);
@@ -154,7 +157,8 @@ public class KvcProbe_ffmpeg {
                         + " -> " + w + "x" + h
                         + "; rawvideo pipe requires a fixed frame size");
             }
-
+// 启动后接着执行这里，并没有 return
+            // 把当前这一帧的 Y、U、V 像素写进管道
             for (int plane = 0; plane < 3; plane++) {
                 Pointer data = ptr(frame).getPointer(plane * 8);
                 int stride = ptr(frame).getInt(64 + plane * 4);
