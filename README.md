@@ -1200,3 +1200,99 @@ width=0，height=0，format=720
 如果有完全匹配的 C 头文件，就可以用 offsetof(AVFrame, width) 等方式由编译器算偏移；目前这些硬编码值，是缺少准确头文件时采用的验证方案。
 
 ```
+
+``` unidbg 函数 指针
+现在的代码传的就是指针。 但它必须是 unidbg 模拟地址空间里的指针，不能直接把 Java 对象地址交给 .so。
+
+还要区分：当前代码调用的是 FFmpeg 的解码接口，没有直接调用 kvc30dec_decode；底层 KVC 函数由库内部调用。
+1. 现在传给解码器的是什么？
+这句：
+call("avcodec_send_packet", ptr(ctx), ptr(pkt));
+对应的 C 接口可以理解为：
+avcodec_send_packet(AVCodecContext *ctx, const AVPacket *pkt);
+两个参数都是模拟内存中的指针：
+ctx → AVCodecContext
+      解码配置、内部状态等
+
+pkt → AVPacket
+      ├─ data → 压缩码流所在内存
+      ├─ size   码流字节数
+      ├─ pts    显示时间戳
+      ├─ dts    解码时间戳
+      └─ 其他信息
+所以它不是只收一个 byte[]，而是收一个描述压缩数据的结构体指针。结构体里面再指向真正的数据。
+2. 现在视频数据是怎样进入内存的？
+你这版代码的路径是：
+Mac 上的 MP4 文件
+    ↓ Java 文件映射
+.so 调用 avformat_open_input
+    ↓
+av_read_frame(fmt, pkt)
+    ↓ .so 的解封装器读取文件、解析 MP4
+AVPacket 中填入压缩包及时间戳
+    ↓
+avcodec_send_packet(ctx, pkt)
+当前不需要 Java 自己把每个压缩包转换为字节数组再传进去。 解封装和包内存管理主要由模拟环境中的库完成。
+
+返回画面时也是指针：
+call("avcodec_receive_frame", ptr(ctx), ptr(fr));
+库把结果填进 fr 指向的 AVFrame，其中 data[] 再指向各个像素平面。Java 随后读取这些内存。
+3. 能否自己读到内存，再把指针交给 .so？
+可以，但分两种情况。
+
+A. 你手上是已经解封装的压缩视频包
+
+可以：
+Java 获得一个压缩包
+    ↓
+在模拟环境中分配 AVPacket 及其数据缓冲
+    ↓
+将压缩字节写入这个模拟缓冲
+    ↓
+设置包长度、PTS 等信息
+    ↓
+传 AVPacket 指针给 avcodec_send_packet
+应优先使用库的 av_packet_alloc、av_new_packet 等接口，让库建立正确的包和缓冲结构，避免手动拼整个结构体。
+
+B. 你手上是完整 MP4 文件的字节
+
+也可以放到内存，但不能把整个 MP4 直接交给视频解码函数。MP4 里面还有轨道、索引、音频、解码配置等信息。
+
+这时通常需要提供内存读取接口，例如自定义 AVIO，让解封装器从内存读：
+内存中的 MP4 → 解封装 → AVPacket → 解码
+在 unidbg 中做回调还要适配模拟环境，复杂度高于目前的文件映射。
+4. 哪种“指针”能传？
+对象	能否直接交给模拟 .so
+Java byte[] 对象本身	不能当作 native 数据指针直接使用
+本机 JVM/native 内存地址	不能直接当作模拟地址
+unidbg 分配的模拟内存指针	可以，前提是数据布局符合接口
+.so 自己分配并返回的指针	可以在对应模拟环境和生命周期内使用
+
+
+这里不存在“给一个地址，库就自动知道长度和格式”。指针只是地址，长度、格式、所有权和生命周期都由函数接口约定。
+
+尤其不能刚传进去就随意释放或改写缓冲。解码器可能保留引用；应使用对应 API 的引用计数和释放规则。
+5. 解码一共调用了几个函数？
+按你贴出的 Java 版本，显式调用了 15 种不同的 .so 导出函数：
+阶段	函数
+日志设置	av_log_set_level
+打开容器	avformat_open_input
+查找解码器	avcodec_find_decoder_by_name
+创建上下文	avcodec_alloc_context3
+复制轨道配置	avcodec_parameters_to_context
+设置选项	av_opt_set_int、av_opt_set
+打开解码器	avcodec_open2
+创建输入／输出对象	av_packet_alloc、av_frame_alloc
+读取压缩包	av_read_frame
+送入压缩包	avcodec_send_packet
+取得解码画面	avcodec_receive_frame
+释放当前包／帧引用	av_packet_unref、av_frame_unref
+
+
+核心解码接口只有两个：
+avcodec_send_packet(ctx, pkt);   // 送入压缩数据
+avcodec_receive_frame(ctx, fr); // 取出解码画面
+但不是每帧只调用一次就一定有结果：解码器可能需要缓存多个包，也可能一次送包后要多次取帧。输入结束后，还需要送空包，让它吐出缓存的剩余画面。
+
+这 15 种函数不是总调用次数；循环中的函数会反复调用，而且 .so 内部还会进一步执行真正的 KVC 解码函数。
+```
