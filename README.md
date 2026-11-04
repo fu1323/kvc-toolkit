@@ -1,4 +1,7 @@
 # KVC Toolkit：快乐的小手 KVC7 视频解码 转码分析  Android逆向 流媒体逆向 Unidbg
+
+> **2026-11-04 新增：带 PTS 的流式转码已实现。** `KvcProbe_ffmpeg` 现在自动启动 Python/PyAV 桥接，把逐帧 PTS 和 YUV 封装为 NUT 后送入本机 FFmpeg，不落盘完整 YUV。运行 `./run_pts.sh 输入.mp4 输出.mp4`；环境准备、IDEA 参数和时间戳处理详见 [带 PTS 的流式转码说明](README-pts-streaming.md)。下文旧的 `transcode_unidbg.py` / `KvcProbe.java` 路线仍保留原有行为。
+
 ## 感谢ChatGPT
 
 > 文档更新：2026-11-03。

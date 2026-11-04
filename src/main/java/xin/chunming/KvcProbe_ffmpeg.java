@@ -11,10 +11,13 @@ import com.github.unidbg.memory.MemoryBlock;
 import com.sun.jna.Pointer;
 
 import java.io.*;
-import java.util.Random;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 /**
- * 转码实现 不写盘yuv 而是pipe交给本机ffmpeg
+ * unidbg -> PTS/YUV 管道 -> Python/PyAV NUT 封装 -> 本机 FFmpeg。
+ * 原始 YUV 不落盘；PTS 从当前解码帧读取。
  *
  *
  */
@@ -37,10 +40,13 @@ public class KvcProbe_ffmpeg {
     }
 
     public static void main(String[] args) throws Exception {
-//        final File input = new File(args[0]);
-        final File input = new File("/Users/fuchunming/Downloads/input.mp4");
-        // int limit = args.length > 2 ? Integer.parseInt(args[2]) : 1;  //limit=1 只解一贞 limit=0 完整
-        int limit = 0;
+        if (args.length > 2) {
+            throw new IllegalArgumentException("Usage: KvcProbe_ffmpeg [input.mp4] [output.mp4]");
+        }
+        final File input = new File(args.length > 0 ? args[0] : "/Users/fuchunming/Downloads/input.mp4");
+        final File output = new File(args.length > 1 ? args[1] : "output_pts_" + System.currentTimeMillis() + ".mp4");
+        if (!input.isFile()) throw new FileNotFoundException(input.toString());
+        if (output.exists()) throw new IOException("Refusing to overwrite " + output);
 
         e = AndroidEmulatorBuilder.for64Bit().setProcessName("kvc-probe").setRootDir(new File(System.getProperty("kvc.rootdir", "work/kvc-root")))
                 .addBackendFactory(new DynarmicFactory(true)).addBackendFactory(new Unicorn2Factory(true)).build();
@@ -69,8 +75,8 @@ public class KvcProbe_ffmpeg {
         long started = System.nanoTime();
 
         // 首帧解出后，才确定尺寸并启动 FFmpeg。
-        try (FfmpegPipe pipe = new FfmpegPipe(input)) {
-            while (limit == 0 || count < limit) {
+        try (FfmpegPipe pipe = new FfmpegPipe(input, output)) {
+            while (true) {
                 if (!drain) {
                     int r = (int) call("av_read_frame", fmt, ptr(pkt));
                     if (r == -541478725) drain = true;
@@ -95,19 +101,21 @@ public class KvcProbe_ffmpeg {
                     if (count == 0) {
                         System.out.println(
                                 "Output: " + w + "x" + h
-                                        + ", yuv420p, pts_time_base must follow input stream"
+                                        + ", yuv420p; bridge reads source stream time_base"
                         );
                     }
 
-                    pipe.writeFrame(fr, w, h);
+                    long pts = ptr(fr).getLong(144); // 此 ARM64 库的 AVFrame.pts 偏移
+                    if (pts == Long.MIN_VALUE) throw new IOException("Decoded frame has no PTS");
+                    pipe.writeFrame(fr, w, h, pts);
                     count++;
                     call("av_frame_unref", ptr(fr));
                     if (count % 100 == 0) System.out.println("frames=" + count);
-                    if (limit > 0 && count >= limit) break;
                 }
                 if (r < 0 && r != -11 && r != -541478725) throw new RuntimeException("receive=" + r);
                 if (drain) break;
             }
+            pipe.finish(count);
         } finally {
             e.close();
         }
@@ -116,49 +124,59 @@ public class KvcProbe_ffmpeg {
 
     private static final class FfmpegPipe implements AutoCloseable {
         private final File input;
+        private final File output;
         private Process process;
-        private OutputStream out;
+        private DataOutputStream out;
         private int width;
         private int height;
+        private boolean finished;
 
-        FfmpegPipe(File input) {
+        FfmpegPipe(File input, File output) {
             this.input = input;
+            this.output = output;
         }
 
-        void writeFrame(long frame, int w, int h) throws IOException {
-            Random random = new Random();
+        void writeFrame(long frame, int w, int h, long pts) throws IOException {
             if (process == null) {
-                // 第一帧进来时，先根据 w/h 启动 FFmpeg
                 width = w;
                 height = h;
-                ProcessBuilder pb = new ProcessBuilder(
-                        "ffmpeg", "-n",
-                        "-f", "rawvideo",
-                        "-pixel_format", "yuv420p",
-                        "-video_size", w + "x" + h,
-                        "-framerate", "30",
-                        "-i", "pipe:0",
-                        "-i", input.getAbsolutePath(),
-                        "-map", "0:v:0",
-                        "-map", "1:a:0?",
-                        "-c:v", "libx264",
-                        "-crf", "18",
-                        "-preset", "fast",
-                        "-c:a", "copy",
-                        "-movflags", "+faststart",
-                        "output_" + random.nextInt() + ".mp4"
-                );
+                File bridge = new File(System.getProperty("kvc.bridge", "pts_bridge.py"));
+                if (!bridge.isFile()) throw new FileNotFoundException("Missing Python bridge: " + bridge);
+                String defaultPython = new File(".venv/bin/python").isFile() ? ".venv/bin/python" : "python3";
+                List<String> command = new ArrayList<>();
+                command.add(System.getProperty("kvc.python", defaultPython));
+                command.add("-u");
+                command.add(bridge.getAbsolutePath());
+                command.add("--input");
+                command.add(input.getAbsolutePath());
+                command.add("--output");
+                command.add(output.getAbsolutePath());
+                command.add("--ffmpeg");
+                command.add(System.getProperty("kvc.ffmpeg", "ffmpeg"));
+                command.add("--ffprobe");
+                command.add(System.getProperty("kvc.ffprobe", "ffprobe"));
+                String audit = System.getProperty("kvc.pts.audit");
+                if (audit != null && !audit.isEmpty()) {
+                    command.add("--audit");
+                    command.add(new File(audit).getAbsolutePath());
+                }
+                ProcessBuilder pb = new ProcessBuilder(command);
                 pb.redirectError(ProcessBuilder.Redirect.INHERIT);
                 pb.redirectOutput(ProcessBuilder.Redirect.INHERIT);
                 process = pb.start();
-                out = new BufferedOutputStream(process.getOutputStream(), 1024 * 1024);
+                out = new DataOutputStream(new BufferedOutputStream(process.getOutputStream(), 1024 * 1024));
+                // Protocol uses Java DataOutputStream's big-endian byte order.
+                out.writeBytes("KVCP0001");
+                out.writeInt(w);
+                out.writeInt(h);
             } else if (w != width || h != height) {
-                throw new IOException("Frame size changed: " + width + "x" + height
-                        + " -> " + w + "x" + h
-                        + "; rawvideo pipe requires a fixed frame size");
+                throw new IOException("Frame size changed: " + width + "x" + height + " -> " + w + "x" + h);
             }
-// 启动后接着执行这里，并没有 return
-            // 把当前这一帧的 Y、U、V 像素写进管道
+            long bytes = (long) w * h + 2L * ((w + 1) / 2) * ((h + 1) / 2);
+            if (bytes > Integer.MAX_VALUE) throw new IOException("Frame too large");
+            out.writeLong(pts);
+            out.writeInt((int) bytes);
+            // 首帧启动桥接进程之后也会继续执行这里，不丢首帧。
             for (int plane = 0; plane < 3; plane++) {
                 Pointer data = ptr(frame).getPointer(plane * 8);
                 int stride = ptr(frame).getInt(64 + plane * 4);
@@ -170,21 +188,31 @@ public class KvcProbe_ffmpeg {
             }
         }
 
+        void finish(long count) throws IOException, InterruptedException {
+            if (process == null) throw new IOException("No video frame decoded");
+            // 显式完成记录：区分正常结束与 Java 崩溃/解码中断。
+            out.writeLong(count);
+            out.writeInt(0);
+            out.close();
+            if (!process.waitFor(120, TimeUnit.SECONDS)) {
+                throw new IOException("Timed out waiting for Python/FFmpeg to finish");
+            }
+            if (process.exitValue() != 0) {
+                throw new IOException("PTS bridge exited with code " + process.exitValue());
+            }
+            finished = true;
+        }
+
         @Override
         public void close() throws IOException, InterruptedException {
-            if (process == null) {
-                throw new IOException("No video frame decoded; FFmpeg was not started");
-            }
+            if (process == null) return;
+            if (!finished && process.isAlive()) process.destroy();
             try {
-                // 关闭 stdin 通知 FFmpeg 输入结束，让它完成编码和 MP4 封装。
-                out.close();
-                int exitCode = process.waitFor();
-                if (exitCode != 0) {
-                    throw new IOException("FFmpeg exited with code " + exitCode);
-                }
+                if (out != null) out.close();
             } finally {
-                if (process.isAlive()) {
+                if (process.isAlive() && !process.waitFor(5, TimeUnit.SECONDS)) {
                     process.destroyForcibly();
+                    process.waitFor();
                 }
             }
         }
