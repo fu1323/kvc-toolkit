@@ -1,6 +1,8 @@
 # KVC Toolkit：快乐的小手 KVC7 视频解码 转码分析  Android逆向 流媒体逆向 Unidbg
 
-> **2026-11-04 新增：带 PTS 的流式转码已实现。** `KvcProbe_ffmpeg` 现在自动启动 Python/PyAV 桥接，把逐帧 PTS 和 YUV 封装为 NUT 后送入本机 FFmpeg，不落盘完整 YUV。运行 `./run_pts.sh 输入.mp4 输出.mp4`；环境准备、IDEA 参数和时间戳处理详见 [带 PTS 的流式转码说明](README-pts-streaming.md)。下文旧的 `transcode_unidbg.py` / `KvcProbe.java` 路线仍保留原有行为。
+> 详细原理：[Java、Python、NUT 与逐帧 PTS](README-PTS-Java-Python-NUT.md)，涵盖二进制协议、PyAV 封装、时间基、音画同步、内存与异常处理，以及为什么 Java 也能实现同一方案。
+
+> **2026-11-04 新增：带 PTS 的流式转码已实现。** `KvcProbe_ffmpeg` 现在自动启动 Python/PyAV 桥接，把逐帧 PTS 和 YUV 封装为 NUT 后送入本机 FFmpeg，不落盘完整 YUV。运行 `./run_pts.sh 输入.mp4 输出.mp4`；环境准备、IDEA 参数和时间戳处理详见 最后 。下文旧的 `transcode_unidbg.py` / `KvcProbe.java` 路线仍保留原有行为。
 
 ## 感谢ChatGPT
 
@@ -1359,3 +1361,1267 @@ avcodec_parameters_to_context() 不只是复制宽高：FFmpeg 的实现会为 e
 
 所以，使用现在的 libffmpeg.so 解复用再解码，这些工作由库处理；如果以后绕过解复用器，直接调用底层 kvc30dec_*，就必须查清楚这份配置应该如何交给底层解码器。
 ```
+# 第二弹 Pyav 实现 逐帧 PTS
+<br>
+<br>
+# 带原始 PTS 的流式转码
+
+
+更新：2026-11-04。本方案修改的是 `xin.chunming.KvcProbe_ffmpeg`。
+原有 `KvcProbe.java` 和 `transcode_unidbg.py` 保留原行为；旧 Python 脚本不会自动使用新流程。
+
+## 数据路径
+
+```text
+Java / unidbg：Android libffmpeg.so 解码 KVC
+    ↓ 当前帧 PTS + 紧凑排列的 YUV420P，二进制管道
+pts_bridge.py：PyAV 将原始视频包封装成 NUT
+    ↓ NUT 管道，含尺寸、像素格式、时间基和逐帧时间戳
+本机 ffmpeg：libx264 CRF18 / preset fast 编码，复制原文件第一条音轨
+    ↓
+H.264 + AAC MP4
+```
+
+不创建完整 YUV 或 NUT 临时文件，也不先把全部帧加载进内存。桥接层缓存相邻帧，以计算持续时间；管道满时写入会等待下游消费。Java、解码器和 x264 还会各自使用工作内存，因此总内存不等于两帧大小。PyAV 在这里负责封装，不使用 Python 环境中的 H.264 编码器。实际编码由 PATH 上的本机 `ffmpeg` 完成。
+
+## 准备和运行
+
+需要 Java 17、Maven、本机 ffmpeg/ffprobe、Python 3.9+，以及当前项目 `lib/` 中匹配的 ARM64 库。
+
+在项目根目录首次配置：
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-pts.txt
+```
+
+运行：
+
+```bash
+./run_pts.sh /Users/fuchunming/Downloads/input.mp4 /Users/fuchunming/Downloads/output-pts.mp4
+```
+
+输出存在时会拒绝覆盖。脚本自动编译 Java，并使用项目 `.venv/bin/python`。
+不给参数时仍默认读取 `/Users/fuchunming/Downloads/input.mp4`，输出项目根目录中的 `output_pts_<时间>.mp4`。
+
+若要保留逐帧核对表，可选：
+
+```bash
+KVC_PTS_AUDIT=/tmp/kvc-pts.csv ./run_pts.sh /Users/fuchunming/Downloads/input.mp4 /Users/fuchunming/Downloads/output-pts.mp4
+```
+
+CSV 只有帧号、原 PTS、修正后 PTS、时间基，不含像素；默认不生成。CSV 也不覆盖已有文件。
+
+使用别的 Python 环境：
+
+```bash
+KVC_PYTHON=/absolute/path/to/venv/bin/python ./run_pts.sh input.mp4 output.mp4
+```
+
+### 在 IDEA 里运行
+
+继续运行 `xin.chunming.KvcProbe_ffmpeg`，工作目录设为本项目根目录。
+程序参数填 `输入文件 输出文件`，含空格的路径用引号包裹。
+默认自动选择项目 `.venv/bin/python`；找不到时才尝试 `python3`。
+如果运行目录不同，需要通过 VM options 指定路径：
+
+```text
+-Dkvc.python=/absolute/path/to/.venv/bin/python
+-Dkvc.bridge=/absolute/path/to/pts_bridge.py
+-Dkvc.libdir=/absolute/path/to/lib
+-Dkvc.rootdir=/absolute/path/to/work/kvc-root
+```
+
+可选 VM options：
+
+```text
+-Dkvc.ffmpeg=/opt/homebrew/bin/ffmpeg
+-Dkvc.ffprobe=/opt/homebrew/bin/ffprobe
+-Dkvc.pts.audit=/tmp/kvc-pts.csv
+```
+
+`kvc.python` 必须是可执行文件路径，不是带额外参数的 shell 命令。
+
+## PTS 如何自动传递
+
+1. Java 成功收到一个 AVFrame 后，读取本库 ABI 的 `frame + 144` 处的 int64 PTS。
+2. 读取同一帧的宽、高和像素格式。第一帧启动 Python 后继续发送自身，不会被丢弃。
+3. Java 先写当前 PTS 和帧字节数，再按行去掉 stride padding，写 Y、U、V 像素。
+4. Python 用本机 ffprobe 读取输入文件的第 0 轨 `time_base`。例如 `1/1000000` 表示一 tick 是一微秒，不能对所有文件写死这个单位。
+5. Python 创建 rawvideo AVPacket，设置 `pts = dts = 当前帧 PTS` 和 `packet.time_base`，然后封装成 NUT。这里 rawvideo 没有 B 帧重排，所以 PTS/DTS 相同；后续 x264 自行产生编码后的 DTS。
+6. 本机 FFmpeg 使用 `-fps_mode:v passthrough -enc_time_base:v demux`，保持逐帧时间信息，不强制重新按 30 fps 排列。
+
+桥接器读取原视频名义帧率，用于视频流描述和末帧时长估计，不把中间帧改造成固定帧率。可取得源轨结尾时会优先用它计算末帧包时长；最终显示时长还取决于编码器及 MP4 封装，样片已实测核对。
+
+### 重复、缺失和倒退的 PTS
+
+- 正常递增：原样保留。
+- 原始 PTS 相等：保留帧，令输出 `max(原 PTS, 上一输出 PTS + 1)`，记录修正。若连续重复，也逐 tick 前移；紧随其后的帧若与修正后时间冲突，同样作最小修正。
+- 原始 PTS 真正倒退：报错，不悄悄排序或改成固定帧率。
+- `AV_NOPTS_VALUE`：报错，不猜测时间戳。
+- 负视频 PTS：当前拒绝。需要统一平移音视频时间轴后才能扩展支持，不能只平移视频。
+
+样片第 423、424 帧原 PTS 都是 14066000；只把第 424 帧改为 14066001，即 +1 微秒。修正意味着这一帧不再逐值等同于原始 PTS，日志和可选 CSV 会明确记录。
+
+## 音视频同步
+
+FFmpeg 使用 `-copyts`，不单独减去视频首帧时间，也不对两个输入分别 `-start_at_zero`。输入视频 PTS 和原音轨保持在同一条时间线上。
+
+输出复制第一条音轨：`-map 1:a:0? -c:a copy`；没有音轨也可以运行。不使用 `-shortest` 截断音频。若来源音频不能直接装入 MP4，需要另行增加音频转码，这版默认样本的 AAC 路径。
+
+对于原文件，系统 FFmpeg 可能仍打印 `unknown codec kvc7`，因为第二个输入包含 KVC 视频轨；它只复制其中的音频，实际视频来自 NUT，所以这个提示本身不代表失败。
+
+## 管道协议 KVCP0001
+
+整数均为大端，与 Java `DataOutputStream` 一致。
+
+| 部分 | 内容 |
+|---|---|
+| 流头，16 字节 | ASCII `KVCP0001`（8 字节），uint32 width，uint32 height |
+| 每帧记录头，12 字节 | int64 PTS，uint32 YUV 字节数 |
+| 每帧数据 | 紧凑 YUV420P，Y 后接 U、V，去掉各行 padding |
+| 完成记录，12 字节 | int64 已发送帧数，uint32 0；之后关闭 stdin |
+
+一个 1280×720 YUV420P 帧为 1382400 字节。每帧 PTS 单位取原文件第 0 轨的时间基，不是固定微秒。
+
+完成记录用于区分正常结束与异常断管：缺字节、没有完成记录、完成计数不符都会报错。Java 只有在 Python 和本机 FFmpeg 都成功退出后才打印 SUCCESS。中途失败可能留下未完成的 MP4，应检查日志并另选输出名或自行删除失败文件后重试。
+
+`out.writeLong(pts)` 只能写给这个 Python 桥接器，不能写进旧的 `-f rawvideo` 输入。NUT 是由 PyAV 生成的真正容器，不是给原始像素加一个自定义头就能让 FFmpeg 识别。
+
+## 限制
+
+- 针对现有 ARM64 `.so` ABI；`AVFrame + 144` 等偏移不能直接套用于其他版本。
+- Java 解码器仍选流索引 0，Python 会确认它是视频；暂不支持视频位于其他轨的文件。
+- 仅支持固定尺寸、偶数宽高的 8-bit YUV420P；中途分辨率变化会报错。
+- 单视频、第一条可选音轨；不复制字幕、附件、旋转矩阵等全部容器元数据。
+- 传递已声明的色彩范围、色彩空间等参数及非方形像素比例；未验证 HDR/10-bit。
+- 不包含网络 RPC，也不是零拷贝；unidbg 内存先复制到 Java 数组，再经过进程管道。
+- 启用的仍是本机 CPU libx264 编码；更换 VideoToolbox 需要另外调整编码参数和验证时间戳。
+
+## 验证
+
+2026-11-04，使用项目 unidbg 0.9.9、Java 17、PyAV 15.1.0、本机 FFmpeg 9.0.1：
+
+- 样片端到端转码：1084 帧、1280×720，约 13.7 秒（此次运行，不含 JVM 初始化）。
+- 输出视频时间基：1/1000000；逐帧显示 PTS 与桥接 CSV 完全一致。
+- Java 读取的 1084 个原 PTS 与提供的 PTS 文本完全一致。
+- 仅一次重复 PTS 修正：第 424 帧 +1 微秒。
+- 音频 779 个压缩包：逐包 SHA-256、PTS、DTS、duration 均与输入一致。
+- 视频时长 36.066666 秒；音频时长 36.060998 秒；两轨起点均为 0。
+
+独立桥接集成测试（不需要 KVC 解码库）：
+
+```bash
+.venv/bin/python -m unittest -v test_pts_bridge.py
+```
+
+覆盖非零时间起点及音频对齐、变帧间隔和重复 PTS、1/90000 时间基及无音轨、异常断管、倒退 PTS、拒绝覆盖文件。测试使用临时目录中的极小视频，不会生成完整样片的 YUV。
+# KVC 流式转码原理：Java、Python、NUT 与逐帧 PTS
+
+日期：2026-11-04  
+对应项目：`/Users/fuchunming/Documents/Codex/2026-11-03/mov-mp4-m4a-3gp-3g2-mj2-6/outputs/kvc-toolkit/unidbg-kvc`
+
+本文记录本次从“Java 输出裸 YUV，FFmpeg 按固定 30 fps 编码”改为“Java 输出帧及 PTS，Python 封装 NUT，本机 FFmpeg 按实际时间戳编码”的设计、实现和验证。代码片段来自当前实现，省略部分参数时会注明。
+
+最关键的结论是：**Java 完全可以传递时间戳。原先的问题出在 rawvideo 输入格式没有携带逐帧 PTS 的位置。Python 的作用，是调用 PyAV，把我们自定义的帧记录转换成 FFmpeg 能理解的 NUT 数据流。**
+
+## 目录
+
+1. [这次解决的具体问题](#1-这次解决的具体问题)
+2. [三个进程与三套 FFmpeg 相关组件](#2-三个进程与三套-ffmpeg-相关组件)
+3. [两根管道实际连接在哪里](#3-两根管道实际连接在哪里)
+4. [为什么裸 YUV 无法传递原始 PTS](#4-为什么裸-yuv-无法传递原始-pts)
+5. [PTS 和 DTS 的时间单位](#5-pts-和-dts-的时间单位)
+6. [Java 如何取出同一帧的像素与 PTS](#6-java-如何取出同一帧的像素与-pts)
+7. [Java 到 Python 的二进制协议](#7-java-到-python-的二进制协议)
+8. [Python 如何正确读取管道](#8-python-如何正确读取管道)
+9. [PyAV 如何把像素和 PTS 封装成 NUT](#9-pyav-如何把像素和-pts-封装成-nut)
+10. [重复时间戳与帧持续时间](#10-重复时间戳与帧持续时间)
+11. [本机 FFmpeg 如何接收和保留时间信息](#11-本机-ffmpeg-如何接收和保留时间信息)
+12. [音视频为什么仍能对齐](#12-音视频为什么仍能对齐)
+13. [内存、背压、吞吐与压缩率](#13-内存背压吞吐与压缩率)
+14. [完成、异常与资源释放](#14-完成异常与资源释放)
+15. [为什么选 Python，如何改成 Java](#15-为什么选-python如何改成-java)
+16. [运行、调试与核对](#16-运行调试与核对)
+17. [已验证结果及适用边界](#17-已验证结果及适用边界)
+18. [常见疑问与参考资料](#18-常见疑问与参考资料)
+
+## 1. 这次解决的具体问题
+
+旧流程已经可以让原始像素不落盘：
+
+```text
+KVC 文件 → unidbg 解码 → Java 写裸 YUV → 管道 → 本机 FFmpeg → H.264 MP4
+```
+
+但是旧命令指定了：
+
+```text
+-f rawvideo -pixel_format yuv420p -video_size 1280x720 -framerate 30 -i pipe:0
+```
+
+FFmpeg 只收到一段连续的像素字节，因此按照帧序号和 30 fps 为输入生成时间戳。原视频中每一帧真正的 PTS 没有被传递。
+
+例如，下面这组显示时间：
+
+```text
+原时间：0 ms，33 ms，67 ms，120 ms
+```
+
+如果只提供四帧像素并声明固定 30 fps，接收端会按近似如下的时间解释：
+
+```text
+新时间：0 ms，33.333 ms，66.667 ms，100 ms
+```
+
+第四帧的时间已经改变。固定帧率输入对原本严格固定帧率、且时间起点已经正确处理的视频可能足够，但无法表达一般的逐帧时间信息。
+
+新的流程补齐了这部分：
+
+```text
+KVC 文件
+   ↓
+Java / unidbg：解出画面，同时读取 PTS
+   ↓ 自定义二进制记录
+Python / PyAV：把画面和 PTS 封装为 NUT
+   ↓ 标准媒体流
+本机 FFmpeg：读取 NUT，编码为 H.264，并复制原文件音频
+   ↓
+MP4
+```
+
+变化发生在传输格式和封装层。KVC 解码算法仍由原 Android 库执行，最终视频编码仍由本机 FFmpeg 完成。
+
+## 2. 三个进程与三套 FFmpeg 相关组件
+
+持续处理视频时，主要有三个宿主机进程：
+
+| 进程 | 主要任务 | 关键数据 |
+|---|---|---|
+| Java / JVM | 运行 unidbg，调用 Android KVC 解码库 | AVFrame、PTS、YUV 像素 |
+| Python | 读取自定义帧记录，调用 PyAV 做 NUT 封装 | 原始视频包及其时间戳 |
+| 本机 ffmpeg | 解复用 NUT、H.264 编码、音频复制、MP4 封装 | 最终编码包和输出 MP4 |
+
+Python 启动时还会短暂运行一次本机 `ffprobe`，读取原文件的轨道信息。
+
+这里有三套容易混淆的组件：
+
+| 组件 | 在哪里运行 | 这次负责什么 |
+|---|---|---|
+| Android `libffmpeg.so` | Java 进程里的 unidbg 模拟环境 | 读取 KVC 文件、执行私有解码器 |
+| PyAV 使用的本机 FFmpeg 动态库 | Python 进程 | 构造原始视频包、生成 NUT |
+| 系统安装的 `ffmpeg` 可执行程序 | 独立的本机进程 | 使用 libx264 编码并生成 MP4 |
+
+PyAV 是 Python 对 FFmpeg 库的绑定。调用 `container.mux()` 时，实际封装工作主要发生在原生库中。
+
+**PyAV 使用的库不必与 PATH 中 `ffmpeg` 的库版本一致。** 两个进程之间传递的是标准 NUT 字节流，而不是跨版本共享 FFmpeg 的内存结构。本次 PyAV 15.1.0 与系统 FFmpeg 9.0.1 已配合运行成功。
+
+unidbg 的模拟环境也不是另一个独立 Android 进程。它位于 JVM 进程内部；模拟器里的地址不能直接作为 Python 或本机 FFmpeg 的有效内存地址。
+
+## 3. 两根管道实际连接在哪里
+
+实际连接方式如下：
+
+```text
+Java ProcessBuilder 启动 Python
+    Java 持有 Python 的 stdin 写入端
+                  │
+                  │ KVCP0001 格式
+                  ▼
+             Python 的 stdin
+                  │
+       Python subprocess.Popen 启动 ffmpeg
+       PyAV 写入 ffmpeg 的 stdin
+                  │
+                  │ NUT 格式
+                  ▼
+              ffmpeg 的 stdin
+                  │
+                  ▼
+               输出 MP4
+```
+
+Java 中：
+
+```java
+process = pb.start(); // 此处启动的是 Python
+out = new DataOutputStream(
+    new BufferedOutputStream(process.getOutputStream(), 1024 * 1024)
+);
+```
+
+`process.getOutputStream()` 是父进程写入子进程标准输入的接口，因此这里写入的内容由 Python 从 `sys.stdin.buffer` 读取。
+
+Python 中：
+
+```python
+process = subprocess.Popen(command, stdin=subprocess.PIPE)  # 启动本机 ffmpeg
+container = av.open(process.stdin, mode='w', format='nut', ...)
+```
+
+`process.stdin` 对应 FFmpeg 的标准输入。PyAV 的封装结果直接写入这个对象。
+
+本实现**没有把 Python 的 stdout 当作 NUT 管道**，也没有让 Java 再转发一次 NUT。Python 直接写自己的 FFmpeg 子进程 stdin。
+
+日志走独立通道：Java 的打印不会混入它写给 Python 的 stdin；Python 诊断主要写 stderr；本机 FFmpeg 的日志也不混入 NUT 输入。
+
+### 这是不是 RPC？
+
+目前是两个具有约定格式的顺序数据流，没有设计 `open`、`seek`、`cancel` 等带请求编号的远程调用接口，因此不需要 RPC 框架。
+
+管道是传输方式；RPC 是调用协议。以后要做常驻解码服务时可以另加 RPC，但它不会自动解决媒体时间戳的封装问题。
+
+## 4. 为什么裸 YUV 无法传递原始 PTS
+
+YUV420P 描述的是像素怎样存储。对于偶数宽高：
+
+```text
+Y：W × H 字节
+U：(W / 2) × (H / 2) 字节
+V：(W / 2) × (H / 2) 字节
+```
+
+1280×720 的一帧是：
+
+```text
+1280 × 720 × 3 / 2 = 1,382,400 字节
+```
+
+裸 rawvideo 输入按指定尺寸和格式，从字节流中每取够一帧的字节数，就得到一幅画面。它没有“接下来这 8 字节是 PTS”的约定。
+
+如果直接这样写给旧的 rawvideo 输入：
+
+```java
+out.writeLong(pts);
+out.write(yuv);
+```
+
+FFmpeg 会把这 8 字节也当成像素。随后帧边界会错位，可能出现画面损坏或帧大小错误。
+
+同样，单独准备一个 `pts.txt`，再给 FFmpeg 加一个普通 `-i pts.txt`，也不会自动把文本中的第 N 行绑定到第 N 帧。必须有理解这种对应关系的程序、专门输入实现或时间戳处理逻辑。
+
+这次使用 Python，正是为了完成“读懂对应关系，并转换为标准媒体流”这一步。
+
+## 5. PTS 和 DTS 的时间单位
+
+### 5.1 PTS 是显示时间戳，必须配合单位
+
+PTS 是整数；`time_base` 表示一个整数单位对应多少秒：
+
+```text
+显示时间（秒）= PTS × time_base
+```
+
+例子：
+
+| PTS | time_base | 显示时间 |
+|---:|---|---:|
+| 33333 | 1/1000000 | 0.033333 秒 |
+| 3000 | 1/90000 | 0.033333… 秒 |
+| 1 | 1/30 | 0.033333… 秒 |
+
+因此，不能看到 `33333` 就认为它必然是微秒。样片使用 `1/1000000`，所以这里一 tick 恰好是一微秒。
+
+当前 Python 从同一个输入文件的第 0 轨读取 `time_base`：
+
+```python
+tb = Fraction(video['time_base'])
+```
+
+用 `Fraction` 保持有理数表示，避免在内部把时间基先转换成不精确的浮点数。
+
+当前 Java 输出帧 PTS 使用原视频轨时间基的约定已经在此库和样片上验证。更换私有库、解复用流程或增加会改时间戳的处理后，应重新核对这个约定。
+
+### 5.2 DTS 是解码时间戳
+
+带 B 帧的压缩视频可能需要先解码后面才显示的参考帧，因此压缩包的解码顺序和显示顺序可能不同。
+
+桥接器接收的是已经解码的完整画面，按解码器输出顺序写入，且要求显示 PTS 非递减。每个 rawvideo 包都能独立还原为一帧，没有跨包参考关系，因此本层设置：
+
+```python
+packet.pts = packet.dts = pts
+```
+
+这只针对中间的 rawvideo/NUT 层。最终 H.264 编码器可以使用 B 帧，并自行生成适合压缩视频的 DTS，最终 MP4 中 PTS 与 DTS 不必相同。
+
+### 5.3 duration 是持续多久
+
+PTS 回答“什么时候显示”，duration 回答“持续多久”。它们也有时间基。
+
+```text
+本帧 PTS：100000
+下帧 PTS：133333
+本帧估算 duration：33333 tick
+```
+
+当前桥接器会暂存上一帧，看到下一帧 PTS 后再计算它的 duration。末帧的处理见第 10 节。
+
+### 5.4 不同层的整数可能不同，实际时间应相同
+
+例如，源时间基是 `1/90000`，某一层输出使用 `1/180000`：
+
+```text
+原 PTS 3000 × 1/90000
+新 PTS 6000 × 1/180000
+```
+
+两者对应同一时刻。这种转换称为时间基换算。通用核对应该比较 `PTS × time_base`，不能只比较整数。
+
+在样片中，源视频和最终视频都是 `1/1000000`，所以可以直接逐项比较 PTS 整数。
+
+## 6. Java 如何取出同一帧的像素与 PTS
+
+收到解码帧后，当前代码读取：
+
+```java
+int w = ptr(fr).getInt(112);
+int h = ptr(fr).getInt(116);
+int pix = ptr(fr).getInt(124);
+long pts = ptr(fr).getLong(144);
+```
+
+这些数字是当前 ARM64 私有库的 AVFrame 字段偏移，不是任意 FFmpeg 版本通用的常量。
+
+随后把同一帧传给写入函数：
+
+```java
+pipe.writeFrame(fr, w, h, pts);
+count++;
+call("av_frame_unref", ptr(fr));
+```
+
+顺序很重要：先读取并发送这帧需要的数据，再解除该 AVFrame 对解码缓冲的引用。
+
+### 6.1 首帧启动后不会丢失
+
+第一帧到达时，程序先得到尺寸，再启动 Python，写入流头；接着在同一次 `writeFrame()` 调用中继续写这帧的记录头和像素。
+
+```text
+收到首帧
+  → 读取宽、高、格式、PTS
+  → 启动 Python
+  → 写流头
+  → 写首帧 PTS 和像素
+  → 返回解码循环
+  → av_frame_unref
+```
+
+启动进程后没有提前 `return`，所以不会跳过第一帧。
+
+### 6.2 为什么逐行写，而不是直接复制一个连续大块
+
+AVFrame 的每个平面都有 `linesize`，它可能比有效像素行更宽，额外空间用于内存对齐。
+
+```java
+Pointer data = ptr(frame).getPointer(plane * 8);
+int stride = ptr(frame).getInt(64 + plane * 4);
+
+for (int y = 0; y < ph; y++) {
+    out.write(data.getByteArray((long) y * stride, pw));
+}
+```
+
+`y * stride` 定位到该行的实际起始地址；`pw` 是这一行要发送的有效像素字节数。
+
+这样输出的是紧凑排列的 Y、U、V，而不是把内存中的行尾填充也带进协议。
+
+### 6.3 解除 AVFrame 引用时，FFmpeg 还没收到会不会出错
+
+不会因为这个顺序而丢失像素：`getByteArray()` 已经把模拟内存中的数据复制成 Java 字节数组，`out.write()` 随后把它交给 Java 缓冲或管道。
+
+写入函数返回后，下游需要的数据已不依赖原 AVFrame 的像素缓冲。数据可能还在 Java 的缓冲区或操作系统管道中，但那是另一份数据。
+
+这也是本实现不能称为零拷贝的原因。
+
+## 7. Java 到 Python 的二进制协议
+
+Java 和 Python 之间采用本项目定义的 `KVCP0001` 协议。它不是 NUT、不是 MP4，也不是 FFmpeg 原生支持的输入格式。
+
+### 7.1 流头：16 字节
+
+| 偏移 | 字节数 | 类型 | 含义 |
+|---:|---:|---|---|
+| 0 | 8 | ASCII | 固定标识 `KVCP0001` |
+| 8 | 4 | uint32 | 宽度 |
+| 12 | 4 | uint32 | 高度 |
+
+Java 写入：
+
+```java
+out.writeBytes("KVCP0001");
+out.writeInt(w);
+out.writeInt(h);
+```
+
+Python 读取：
+
+```python
+magic, width, height = struct.unpack('>8sII', read_exact(source, 16))
+```
+
+### 7.2 每帧记录：12 字节记录头，加像素
+
+| 偏移 | 字节数 | 类型 | 含义 |
+|---:|---:|---|---|
+| 0 | 8 | int64 | 当前帧 PTS |
+| 8 | 4 | uint32 | 后续像素字节数 |
+| 12 | 按尺寸计算 | bytes | 紧凑 YUV420P 像素 |
+
+Java：
+
+```java
+out.writeLong(pts);
+out.writeInt((int) bytes);
+// 接着逐行写入像素
+```
+
+Python：
+
+```python
+original, size = struct.unpack('>qI', read_exact(source, 12))
+pixels = read_exact(source, size)
+```
+
+符号解释：
+
+- `>`：大端字节序，高位字节在前。
+- `q`：8 字节有符号整数。
+- `I`：4 字节无符号整数。
+- `8s`：8 字节字符串。
+
+Java 的 `DataOutputStream` 按大端写整数，所以 Python 要用 `>` 读取。Java 没有独立的 uint32 类型，但这里尺寸和字节数都被限制在正数范围内，写出的位模式与 Python 读取的 uint32 一致。
+
+### 7.3 完成记录
+
+正常结束时，Java 发送：
+
+```java
+out.writeLong(count);
+out.writeInt(0);
+out.close();
+```
+
+大小为 0 时，这条记录不是视频帧；前面的 int64 表示总帧数。
+
+Python 检查总帧数是否与自己收到的帧数一致，并确认后面没有多余字节。
+
+因此整个流类似：
+
+```text
+[KVCP0001 + 宽 + 高]
+[PTS_0 + 字节数 + YUV_0]
+[PTS_1 + 字节数 + YUV_1]
+...
+[总帧数 + 0]
+[EOF]
+```
+
+### 7.4 哪些信息没有放进这个协议
+
+当前协议只在流头传宽高；像素格式由双方约定为 YUV420P。
+
+时间基没有放入 KVCP0001 流头，而是由 Python 根据 `--input` 指定的同一个原文件读取。色彩参数、名义帧率和源轨道时长也来自该文件。
+
+所以，**这一版自定义管道不是完全自描述的通用视频协议**。调用方必须提供正确的原文件。以后若要脱离原文件或跨机器运行，应给协议增加版本化的时间基、像素格式、轨道信息等字段。
+
+## 8. Python 如何正确读取管道
+
+管道是连续的字节流，不保证 Java 一次 `write()` 恰好对应 Python 一次 `read()`。
+
+Java 写入一条记录，操作系统可能分多次交付；Java 分几次写入的数据，也可能被一次读取拿到。
+
+因此程序使用 `read_exact()`：
+
+```python
+def read_exact(source, size):
+    chunks = bytearray()
+    while len(chunks) < size:
+        part = source.read(size - len(chunks))
+        if not part:
+            raise EOFError('Java stream truncated ...')
+        chunks.extend(part)
+    return bytes(chunks)
+```
+
+它把“读取一个精确长度的字段或帧”建立在普通字节流之上。
+
+读取像素之前，程序会检查记录声明的字节数是否与宽高对应：
+
+```python
+frame_size = width * height + 2 * ((width + 1) // 2) * ((height + 1) // 2)
+```
+
+若协议错位、格式不匹配或尺寸不对，会报错，而不是拿错长度继续处理后续所有帧。
+
+这是为什么协议中既有宽高，又保留每帧字节数：对当前固定格式而言，字节数可以计算出来，但显式记录方便逐帧校验。
+
+## 9. PyAV 如何把像素和 PTS 封装成 NUT
+
+### 9.1 先创建一个写向 FFmpeg stdin 的 NUT 输出
+
+关键代码：
+
+```python
+container = av.open(
+    process.stdin,
+    mode='w',
+    format='nut',
+    options={
+        'avoid_negative_ts': 'disabled',
+        'flush_packets': '1',
+    },
+)
+
+stream = container.add_stream('rawvideo', rate=rate)
+stream.width = width
+stream.height = height
+stream.pix_fmt = 'yuv420p'
+stream.time_base = tb
+stream.codec_context.time_base = tb
+container.start_encoding()
+```
+
+这里的容器输出目标是一个可写的管道对象，不是磁盘文件名。
+
+`rawvideo` 在这里表示 NUT 中的视频流装的是原始像素。它与旧流程的“直接以 rawvideo 为输入格式读裸字节”有区别：
+
+| 形式 | 像素 | 容器中的尺寸、格式、时间戳 |
+|---|---|---|
+| 裸 YUV / rawvideo 字节流 | 有 | 无逐帧 PTS，尺寸格式需另外指定 |
+| NUT 中的 rawvideo 视频流 | 有 | 有标准容器结构来描述 |
+
+`container.start_encoding()` 这个名字容易误解。此处调用它是为了初始化输出并写容器头，可能伴随相关 codec context 初始化；这不表示已经在做 H.264 压缩。代码没有调用 `stream.encode(frame)` 来压缩这些像素。
+
+### 9.2 每一帧生成一个 rawvideo 包
+
+```python
+packet = av.Packet(pixels)
+packet.stream = stream
+packet.pts = packet.dts = pts
+packet.time_base = tb
+packet.duration = duration
+packet.is_keyframe = True
+container.mux(packet)
+```
+
+逐句理解：
+
+| 操作 | 作用 |
+|---|---|
+| `av.Packet(pixels)` | 创建携带这帧紧凑像素数据的视频包 |
+| `packet.stream = stream` | 指定它属于哪个输出视频流 |
+| 设置 `pts`、`dts` | 指定该 rawvideo 包的时间 |
+| 设置 `time_base` | 指定这些整数的时间单位 |
+| 设置 `duration` | 提供该帧持续时间信息 |
+| `is_keyframe = True` | 表明这个原始视频包可独立解码 |
+| `container.mux(packet)` | 由封装器生成标准 NUT 字节并写出 |
+
+这里把每个 rawvideo 包标记为关键帧，**不会迫使最终 H.264 每帧都是 I 帧**。H.264 编码器会对收到的画面重新做帧型选择和帧间预测。
+
+### 9.3 赋值 PTS 和写出 PTS 是两步
+
+```python
+packet.pts = pts
+```
+
+只是修改 Python 绑定的底层包结构中的字段。此时，下游 FFmpeg 还没有因为这句赋值收到任何时间戳。
+
+```python
+container.mux(packet)
+```
+
+才会让 NUT 封装器把包的时间信息转换成符合 NUT 规则的字节表示。接收端的 NUT 解复用器按同一规则恢复出包和时间戳。
+
+因此，不能用“把 AVPacket 结构体直接 memcpy 到管道”替代 mux。结构体中可能包含指针，而且布局依赖 ABI；容器格式才是跨进程、跨版本交换媒体数据的约定。
+
+### 9.4 Python 为什么不需要自己理解全部 NUT 字节格式
+
+当前 Python 负责准备字段、调用 API。包头、时间戳编码、同步结构等具体格式，由 PyAV 背后的 FFmpeg NUT 封装器处理。
+
+这就是采用 Python/PyAV 的主要便利：无需在 Java 里实现并维护一套 NUT 写入器。
+
+### 9.5 NUT 不会让 1.5 GB 的像素变成几 MB
+
+本例中 NUT 封装的仍是原始 YUV，数据量接近 YUV 总量，加上少量容器结构。它解决的是可解析的帧与时间信息传输。
+
+把视频压缩到最终大小的是后面的 libx264。因为 NUT 走管道而不是写文件，所以不需要为整个中间流准备同样大小的磁盘空间。
+
+### 9.6 为什么选择 NUT
+
+NUT 可以承载原始视频和时间戳，FFmpeg 有现成的读写支持，本方案已验证可通过不可寻址的管道使用。
+
+它不是唯一可选容器。其他容器需要考虑原始视频兼容性、时间精度、流式写入和接收端支持，不能只把 `-f nut` 改成另一个名字就认为具有相同表现。
+
+MP4 也不能笼统地说“不能用于管道”：碎片化 MP4 等模式可以流式写入。但对本次未压缩 YUV 的中间传输，当前 NUT 方案已经满足需求。
+
+## 10. 重复时间戳与帧持续时间
+
+### 10.1 样片的 PTS 并非全程等间隔
+
+提供的 PTS 文件共 1084 项。相邻时间戳差值统计如下，单位为源时间基的 tick：
+
+| 相邻差值 | 次数 |
+|---:|---:|
+| 33333 | 721 |
+| 33334 | 359 |
+| 32667 | 1 |
+| 0 | 1 |
+| 667 | 1 |
+
+其中第 423、424 帧的 PTS 都是 `14066000`。
+
+仅依据视频看起来大约 30 fps，就按 `N / 30` 重建时间戳，会忽略这些实际信息。
+
+### 10.2 本实现如何处理重复值
+
+代码保留画面，并做最小的整数时间修正：
+
+```python
+pts = original if last_output is None else max(original, last_output + 1)
+```
+
+对于样片：
+
+```text
+第 423 帧：14066000 → 14066000
+第 424 帧：14066000 → 14066001
+```
+
+时间基为 `1/1000000`，所以改动是 1 微秒。
+
+这是一项明确的实现策略：为了给当前链路提供严格递增的显示时间，避免重复时间戳引起后续处理歧义，保留帧并微调时间。它不意味着所有容器和所有编码器在任何场景都绝对禁止重复 PTS。
+
+也不能称为“所有原 PTS 一字不改”。准确说法是：**输出匹配经过记录的最小修正时间线，样片只修正了一帧。**
+
+连续重复时，会逐 tick 推进。如果紧接着的原始 PTS 被前面的修正追上，也会作同样的最小修正，并记录。
+
+### 10.3 哪些情况报错
+
+| 情况 | 当前行为 |
+|---|---|
+| PTS 正常递增 | 保留 |
+| 原始 PTS 相等 | 保留帧并微调，记录日志 |
+| 原始 PTS 比上一原始 PTS 更小 | 报错，不擅自重排画面 |
+| PTS 是 `AV_NOPTS_VALUE` | 报错，不按帧号猜时间 |
+| 视频 PTS 为负数 | 当前不支持，报错 |
+
+若未来要支持负视频 PTS，需要设计音视频共同时间平移，以及容器对负时间的处理。只给视频加一个偏移会破坏它与原音轨的相对关系。
+
+### 10.4 为什么要缓存上一帧
+
+收到当前帧后，可以知道上一帧应该持续多久：
+
+```python
+if pending is not None:
+    mux(pending, pts - pending[0])
+pending = (pts, pixels)
+```
+
+例如：
+
+```text
+收到 A，PTS=100000：先保存 A
+收到 B，PTS=133333：给 A duration=33333，写出 A，保存 B
+收到 C，PTS=200000：给 B duration=66667，写出 B，保存 C
+```
+
+这会带来一帧左右的等待，但不会要求先读取完整视频。
+
+### 10.5 末帧没有下一帧，怎么办
+
+当前实现先按名义帧率估算末帧时长：
+
+```python
+duration = max(1, round(1 / rate / tb))
+```
+
+若原轨道提供起点和总时长，并且算出的剩余时长为正，就优先使用：
+
+```text
+末帧 duration = 原轨道 start_pts + duration_ts - 末帧 PTS
+```
+
+这些信息依赖源文件元数据，并非所有文件都一定准确。NUT、解码器、编码器和最终 MP4 也可能重新推导持续时间；设置中间 `packet.duration` 不等于保证最终每一帧 duration 都逐值照抄。
+
+因此，验证时同时检查输出逐帧显示时间和轨道结尾。样片最终视频时长为 36.066666 秒，符合预期。
+
+## 11. 本机 FFmpeg 如何接收和保留时间信息
+
+当前命令的核心结构如下，省略按输入补充的色彩和像素比例参数：
+
+```bash
+ffmpeg -hide_banner -nostdin -n -copyts \
+  -f nut -i pipe:0 \
+  -i input.mp4 \
+  -map 0:v:0 -map '1:a:0?' \
+  -c:v libx264 -crf 18 -preset fast \
+  -fps_mode:v passthrough \
+  -enc_time_base:v demux \
+  -video_track_timescale 1000000 \
+  -c:a copy -avoid_negative_ts disabled \
+  -movflags +faststart output.mp4
+```
+
+上面的 `1000000` 是样片示例；程序实际从源时间基的分母取得，不是对所有文件写死。
+
+| 参数 | 在本流程中的作用 |
+|---|---|
+| `-f nut -i pipe:0` | 把标准输入按 NUT 解复用，读到尺寸、格式及时间戳 |
+| 第二个 `-i input.mp4` | 从原文件取得音频 |
+| `-map 0:v:0` | 视频来自 NUT 输入 |
+| `-map 1:a:0?` | 音频来自原文件第一条音轨，没有则跳过 |
+| `-copyts` | 尽量保留输入时间信息，不默认把输入时间起点消掉 |
+| `-fps_mode:v passthrough` | 不为了凑固定帧率而主动补帧或丢帧 |
+| `-enc_time_base:v demux` | 编码时间基采用输入解复用器提供的时间基 |
+| `-video_track_timescale` | 指定 MP4 视频轨时间刻度，保留所需时间精度 |
+| `-c:a copy` | 复制音频压缩包，不重新编码音频 |
+| `-avoid_negative_ts disabled` | 禁用这一层为了避免负时间而自动移动时间线的策略 |
+| `-movflags +faststart` | 输出完成时把 MP4 索引移到前面，便于播放读取 |
+
+`-copyts` 不是独立的“保真开关”。输入是否正确传来时间戳、帧率同步策略、编码时间基和封装时间刻度都影响结果，必须一起检查。
+
+`-nostdin` 禁用的是 FFmpeg 从标准输入读取交互命令的机制，不会阻止显式指定的 `pipe:0` 媒体输入。
+
+新流程不再需要手工指定输入 `-video_size`、`-pixel_format`、`-framerate 30`，因为 NUT 头携带了视频流描述。
+
+`-enc_time_base` 选择足够细的刻度很重要。如果采用 `1/30`，1 微秒的差异根本无法用整数 tick 表达，可能被量化掉。本方案还设置 MP4 视频时间刻度，以免封装时再次丢失需要的精度。
+
+## 12. 音视频为什么仍能对齐
+
+视频来自 Java 解码后的时间线，音频来自原文件。如果两者都保留原来的时间坐标，它们的相对位置就保持不变。
+
+例如，原文件是：
+
+```text
+视频首帧：5.000 秒
+音频起点：5.020 秒
+```
+
+音频应比视频晚 20 毫秒。保留两者的时间，或者统一减去 5 秒，都能保留这个关系。
+
+但如果只对视频执行：
+
+```text
+video_pts = video_pts - first_video_pts
+```
+
+同时原样复制音频，那么会变成：
+
+```text
+视频首帧：0.000 秒
+音频起点：5.020 秒
+```
+
+原本 20 毫秒的偏移会被错误改成 5.020 秒。
+
+当前实现不单独减去视频首帧 PTS，并使用 `-copyts` 保留共同时间坐标。额外测试覆盖了非零起点下的音频时间及压缩包一致性。
+
+### 为什么 native FFmpeg 还打开一次 KVC 文件
+
+它需要读取原音频。命令明确映射：
+
+```text
+输入 0 的视频 → 输出视频
+输入 1 的音频 → 输出音频
+```
+
+本机 FFmpeg 无需解码输入 1 中的 KVC 视频，只需能够解析容器和读取 AAC 包。因此它可能仍提示输入 1 的 `kvc7` 视频编码未知，但整体转码可以成功。
+
+原文件会被两个不同组件读取：Android 库用于 KVC 解码，本机 FFmpeg 用于音频复制；Python 的 ffprobe 也会读取其轨道元数据。
+
+### 音频比视频略短是否就是不同步
+
+不一定。样片视频为 36.066666 秒，音频为 36.060998 秒，存在几毫秒长度差。这与音频压缩帧粒度、轨道时长记录等有关，不能单凭总时长不完全相等认定同步失败。
+
+更直接的检查是：音视频起点、视频显示时间线、音频每包 PTS/DTS、结尾及必要时实际播放表现。
+
+## 13. 内存、背压、吞吐与压缩率
+
+### 13.1 累计经过 1.5 GB，不等于同时占用 1.5 GB
+
+样片每帧 1,382,400 字节，总共 1084 帧：
+
+```text
+1,382,400 × 1084 = 1,498,521,600 字节
+约 1.50 GB，或 1.40 GiB
+```
+
+这是全部原始像素累计流过的数据量。
+
+流式处理时，前面的帧被消费后，后面才继续生产。当前桥接代码保存上一帧和正在读取的当前帧，不建立存放整段视频的列表。
+
+不过，“桥接层逻辑上保存相邻帧”不等于整个进程只有两帧内存：还包括 Python 的临时复制、PyAV 包、Java 行数组和缓冲、操作系统管道、解码器参考帧、x264 前视及参考帧等。
+
+应把它理解为不会随视频长度线性积累完整 YUV，而不是一个已经测得的固定总内存上限。
+
+### 13.2 背压怎样限制生产速度
+
+```text
+FFmpeg 编码变慢
+   ↓
+Python 写往 FFmpeg 的管道暂时写不进去
+   ↓
+Python 暂停读取 Java 的下一帧
+   ↓
+Java 写往 Python 的管道逐渐填满
+   ↓
+Java 的 write() 等待，解码循环暂停推进
+```
+
+这种由下游处理速度向上游传递的等待就是背压。操作系统管道有容量限制，当前程序没有在它们前面增加无限增长的内存队列。
+
+某次写入暂时阻塞不一定是死锁，也可能只是正常等待编码器消费。若下游异常退出，则应结合进程状态和错误日志判断。
+
+### 13.3 这是不是零拷贝
+
+不是。至少存在以下数据转换或复制环节：
+
+```text
+模拟器内存 → Java byte[] → Java/系统管道缓冲
+→ Python 字节对象 → PyAV 包/原生缓冲 → 另一根管道
+→ 本机 FFmpeg
+```
+
+具体实现可能在某些环节复用内存，但整个链路没有建立跨 JVM、Python、FFmpeg 的共享帧缓冲。
+
+优化这类复制需要单独设计共享内存或原生接口，不能只把 Java 数组换成一个数字指针。
+
+### 13.4 能否按 PTS sleep，再继续输出裸 YUV
+
+这样只能改变数据抵达速度，不能替代媒体时间戳。
+
+旧的 rawvideo 输入仍按照声明的帧率产生时间戳。线程调度、解码耗时和管道缓冲还会让实际到达时间产生抖动，并可能把本可快于实时完成的转码拖慢到实时。
+
+如果某种输入机制特意用墙钟生成时间戳，那也是另一种设计，记录的是到达时间，而不是当前需要保留的原视频显示时间。
+
+### 13.5 一帧一帧写入会不会影响帧间预测
+
+不会因为“逐帧传输”本身失去帧间预测。编码器本来就是接收一帧一帧画面，然后在内部保存参考帧、做前视和选择 I/P/B 帧。
+
+NUT 中的每个 rawvideo 包可独立解码，与最终 libx264 是否使用帧间预测是不同层次。
+
+本次完整输出的编码日志包含：
+
+```text
+I 帧：12
+P 帧：327
+B 帧：745
+合计：1084
+```
+
+这也直接表明最终 H.264 并非全 I 帧编码。
+
+### 13.6 最终文件为什么可能比 KVC 大很多
+
+当前参数 `libx264 -crf 18 -preset fast` 以质量为目标，不承诺与原 KVC 相同码率或体积。
+
+编码算法、质量目标、编码速度设置、画面内容及原视频处理方式都会影响码率。桥接器增加的 NUT 字节不会直接成为最终 H.264 压缩码流。
+
+本次最终文件约 31.27 MB；这个大小不能单独证明管道妨碍了预测。调整压缩率属于编码参数选择，和“怎样正确传 PTS”是两个可以分别处理的问题。
+
+## 14. 完成、异常与资源释放
+
+### 14.1 正常完成的顺序
+
+```text
+Java 读到输入结束
+  → 给解码器发送空包，取出缓存中的剩余帧
+  → 发送所有帧记录
+  → 发送总帧数完成记录
+  → 关闭 Python stdin
+Python
+  → 核对完成计数和 EOF
+  → 写出暂存的末帧
+  → 关闭 NUT 输出
+  → 关闭 FFmpeg stdin
+FFmpeg
+  → 排空编码器中的延迟帧
+  → 完成 MP4 封装及 faststart
+  → 返回退出码
+Python
+  → 检查 FFmpeg 退出码
+  → 返回退出码
+Java
+  → 检查 Python 退出码
+  → 关闭模拟器，打印 SUCCESS
+```
+
+“像素写完了”并不等于“输出 MP4 已经完成”。最后还可能有编码器缓存帧和容器尾部工作，因此必须等待退出结果。
+
+### 14.2 为什么 EOF 之外还需要完成记录
+
+如果 Java 在发送了几帧后崩溃，Python 也会看到 EOF。仅把 EOF 当正常结束，就可能把半段视频误报为成功。
+
+当前协议要求明确的完成记录和正确帧数。缺记录、帧字节不足、计数不符都会失败。
+
+### 14.3 出错后可能留下什么
+
+中途失败时可能留下不完整的 MP4 和部分审计 CSV。当前程序不会把所有失败输出自动删除，也没有使用“临时输出成功后再原子改名”的发布机制。
+
+输出名已存在时会拒绝覆盖。重试时应根据日志确认失败原因，并选新的输出名，或自行处理上次失败文件。
+
+Python 会在异常路径尝试结束 FFmpeg 子进程；Java 也会结束失败或未正常完成的桥接子进程。正常结束阶段配置了 120 秒等待，异常清理阶段先等待 5 秒，再按需要强制结束。这些等待限制不是完整视频任务的总时限。
+
+### 14.4 当前 Java 解码循环的边界
+
+这次重点改动是传输和封装。现有解码器的 ABI 偏移、流索引选择等约定仍然存在。
+
+当前 `avcodec_send_packet()` 遇到负返回值会直接报错，没有实现所有解码器都适用的 EAGAIN 重试状态机。样片已经跑通，但不能仅凭这次验证把外壳称为可适配任意 FFmpeg 解码器的通用实现。
+
+## 15. 为什么选 Python，如何改成 Java
+
+### 15.1 Java 能直接做吗
+
+能。Java 可以写任意二进制格式，也可以调用本机 FFmpeg 库。
+
+问题不是语言能力，而是需要有人承担以下工作：
+
+```text
+拿到像素与 PTS
+  → 建立视频流描述
+  → 构造携带时间戳的包
+  → 按 NUT 标准封装
+  → 把结果交给本机 FFmpeg
+```
+
+当前把中间几步交给 PyAV，是因为它已有可调用的封装接口，而且项目已经有可验证的 Python/PyAV 环境。
+
+### 15.2 三种实现方式对比
+
+| 路线 | 中间封装由谁负责 | 主要代价 | 当前状态 |
+|---|---|---|---|
+| Java → Python/PyAV → NUT | PyAV 背后的本机 FFmpeg 库 | 多一个 Python 进程和环境 | 已实现、已验证 |
+| Java → JavaCPP/JNI → NUT | Java 调用本机 FFmpeg 库 | 本机库依赖、指针生命周期、输出回调 | 这里仅讨论，尚未实现 |
+| Java 自己写 NUT 字节 | Java 实现 NUT 写入器 | 需要维护正确的协议实现 | 这里仅讨论，尚未实现 |
+
+第二条路线可以去掉 Python 进程和第一段自定义字节协议，但不会自动把整条链路变成零拷贝。模拟器像素仍需要进入宿主机封装器可用的内存；若最后仍使用独立 FFmpeg 进程，也还需要管道传输。
+
+第三条路线能够减少原生封装依赖，但要处理真实 NUT 格式中的头、包编码和校验等规则。不能用当前 `KVCP0001` 的十几字节记录头冒充标准 NUT。
+
+### 15.3 JavaCPP 调用的是哪套库
+
+如果采用 JavaCPP/JNI，本段需要的是适合宿主机平台的本机库，例如 macOS arm64 FFmpeg 库。
+
+Android 的 ELF `.so` 已由 unidbg 运行；它与 macOS 本机库有不同的运行环境。模拟器里的 AVFrame 地址不能直接塞给宿主机 FFmpeg 的函数。
+
+也可以进一步研究通过 unidbg 调用 Android 库里的封装函数，但那会涉及该库是否提供相应 muxer、模拟环境中的 I/O 回调、更多 ABI 和模拟执行开销。本次没有实现这条路线。
+
+### 15.4 为什么不直接让 PyAV 编 H.264
+
+技术上可以，也可以得到“Java 解码 → Python/PyAV 编码并封装”的另一种流程。
+
+这次选定的目标是继续使用本机 `ffmpeg` 可执行程序来编码，所以 Python 只做 NUT 封装。这样编码器选择、系统 FFmpeg 的构建能力和命令行参数都集中在最后一步。
+
+当前最后一步仍是 CPU libx264。若以后换成 VideoToolbox，需要另行修改编码参数并验证时间精度、质量和兼容性；KVC 解码部分不会因此自动变成硬件解码。
+
+## 16. 运行、调试与核对
+
+### 16.1 相关文件
+
+项目根目录：
+
+```text
+/Users/fuchunming/Documents/Codex/2026-11-03/mov-mp4-m4a-3gp-3g2-mj2-6/outputs/kvc-toolkit/unidbg-kvc
+```
+
+| 文件 | 作用 |
+|---|---|
+| `src/main/java/xin/chunming/KvcProbe_ffmpeg.java` | 解码，读取 PTS，写自定义协议，管理 Python 子进程 |
+| `pts_bridge.py` | 读协议、校验及微调 PTS、封装 NUT、启动和等待本机 FFmpeg |
+| `requirements-pts.txt` | 当前固定 `av==15.1.0` |
+| `run_pts.sh` | 使用项目 Python 环境，编译并运行 Java |
+| `test_pts_bridge.py` | 不依赖 KVC 库的桥接集成测试 |
+| `README-pts-streaming.md` | 较短的使用说明 |
+| `work/pts-validation.csv` | 本次完整验证的逐帧时间戳记录 |
+| `work/pts-validation.log` | 本次完整验证的运行日志 |
+| `work/pts-validation.mp4` | 本次生成的验证视频 |
+
+旧的 `KvcProbe.java` 和 `transcode_unidbg.py` 没有切换为这条流程。运行旧入口不会自动获得新的 NUT 管道方案。
+
+### 16.2 首次配置
+
+在项目根目录执行：
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-pts.txt
+```
+
+本次已在指定项目内配置完成。复制项目到其他机器时，需要为该机器重新建立环境，并准备对应平台的本机工具。
+
+### 16.3 转码
+
+```bash
+./run_pts.sh /Users/fuchunming/Downloads/input.mp4 /Users/fuchunming/Downloads/output-pts.mp4
+```
+
+输出存在时拒绝覆盖。不给参数时，Java 仍默认读取 `/Users/fuchunming/Downloads/input.mp4`，输出名称含当前时间。
+
+### 16.4 保存 PTS 对照表
+
+```bash
+KVC_PTS_AUDIT=/tmp/kvc-pts.csv \
+  ./run_pts.sh /Users/fuchunming/Downloads/input.mp4 /Users/fuchunming/Downloads/output-pts.mp4
+```
+
+CSV 记录：
+
+```text
+frame,original_pts,output_pts,time_base
+...
+423,14066000,14066000,1/1000000
+424,14066000,14066001,1/1000000
+...
+```
+
+CSV 只是核对日志，不是传给 FFmpeg 的时间戳来源。即使不生成 CSV，PTS 也已经通过二进制帧记录和 NUT 自动传递。
+
+### 16.5 在 IDEA 中运行
+
+继续运行 `xin.chunming.KvcProbe_ffmpeg`，工作目录设为项目根目录。程序参数可以填输入和输出文件路径。
+
+默认选择项目 `.venv/bin/python`。如果路径不同，通过 VM options 设置：
+
+```text
+-Dkvc.python=/absolute/path/to/python
+-Dkvc.bridge=/absolute/path/to/pts_bridge.py
+-Dkvc.libdir=/absolute/path/to/lib
+-Dkvc.ffmpeg=/opt/homebrew/bin/ffmpeg
+-Dkvc.ffprobe=/opt/homebrew/bin/ffprobe
+-Dkvc.pts.audit=/tmp/kvc-pts.csv
+```
+
+这些属性都是可选覆盖项，路径示例需要按实际位置填写。`kvc.python` 是可执行文件路径，不是包含多个参数的 shell 命令。
+
+### 16.6 查看最终视频的逐帧时间
+
+```bash
+ffprobe -v error -select_streams v:0 \
+  -show_frames \
+  -show_entries frame=pts,pts_time,duration \
+  -of json output-pts.mp4
+```
+
+对视频使用 `-show_frames`，可以按解码后的显示帧核对。最终 H.264 含 B 帧时，若只按压缩包读取顺序逐项比较 PTS，容易把解码顺序与显示顺序混淆。
+
+检查轨道时间基和时长：
+
+```bash
+ffprobe -v error \
+  -show_entries stream=index,codec_name,time_base,start_time,duration,nb_frames \
+  -of json output-pts.mp4
+```
+
+检查音频包的内容和时间：
+
+```bash
+ffprobe -v error -select_streams a:0 \
+  -show_packets -show_data_hash sha256 \
+  -show_entries packet=pts,dts,duration,data_hash \
+  -of json output-pts.mp4
+```
+
+对原文件执行同一音频命令后，可以逐包比较。只检查最终 MP4 文件哈希没有意义，因为容器和视频编码都已经改变。
+
+### 16.7 独立桥接测试
+
+```bash
+.venv/bin/python -m unittest -v test_pts_bridge.py
+```
+
+当前 5 个测试方法覆盖：
+
+- 非零视频起点下，变帧间隔、重复 PTS 修正及音频包一致性。
+- `1/90000` 时间基及没有音轨的输入。
+- 缺少完成记录的异常断流不能当作成功。
+- 真正倒退的 PTS 被拒绝。
+- 已有输出文件不会被覆盖。
+
+测试用临时目录中的小视频完成，不需要运行 KVC 解码器。
+
+## 17. 已验证结果及适用边界
+
+### 17.1 本次完整样片验证
+
+| 项目 | 结果 |
+|---|---|
+| 日期 | 2026-11-04 |
+| Java / unidbg | Java 17，unidbg 0.9.9 |
+| PyAV | 15.1.0 |
+| 本机 FFmpeg | 9.0.1 |
+| 视频尺寸 | 1280×720 |
+| 输出视频帧数 | 1084 |
+| 源与输出视频时间基 | 1/1000000 |
+| 输出显示 PTS | 与审计 CSV 的修正后 PTS 逐项一致 |
+| 原始解码 PTS | 与用户提供的 1084 项 PTS 文本一致 |
+| 时间戳修正 | 第 424 帧 +1 微秒，共 1 次 |
+| 音频包数 | 779 |
+| 音频核对 | 每包 SHA-256、PTS、DTS、duration 与原文件一致 |
+| 视频时长 | 36.066666 秒 |
+| 音频时长 | 36.060998 秒 |
+| 两轨起点 | 均为 0 |
+| 最终文件大小 | 31,269,026 字节 |
+| 项目入口实测计时 | 约 13.21 秒 |
+| 原输入文件 | 与验证前的副本 SHA-256 一致 |
+
+13.21 秒来自 Java 中解码循环开始后的计时，包含桥接和等待编码完成，不包含 Maven 编译、JVM 启动和之前的解码器初始化；它是本机这次样片的观测值，不是所有视频的性能保证。
+
+这些结果证明了该样片的帧数、显示时间和音频包传递正确。最终 H.264 使用 CRF18 有损编码，因此不能把它描述为相对原始解码像素的无损转码。
+
+### 17.2 当前限制
+
+- 针对当前 ARM64 私有库的结构偏移和解码行为。
+- 视频必须位于流索引 0，当前不自动选择其他视频轨。
+- 只支持固定尺寸、偶数宽高的 8-bit YUV420P。
+- 视频 PTS 缺失、为负或真正倒退时失败。
+- 输出使用第一条可选音轨；不处理多音轨选择、字幕、附件等完整容器保留。
+- 默认音频直接复制；若源音频编码不能装进 MP4，需要另外增加转码策略。
+- 复制已声明的部分色彩参数，并处理非方形像素比例；不承诺保留全部旋转或 HDR 元数据。
+- 按当前完整文件转码路径估算末帧持续时间；不提供剪辑、seek、实时直播等完整时间轴处理。
+- 中间流不落盘，但最终 MP4、可选 CSV、测试日志和运行环境文件仍会写磁盘。
+
+## 18. 常见疑问与参考资料
+
+### Python 是不是又解码了一遍 KVC？
+
+没有。Python 收到的是解码后的像素。它调用 ffprobe 读取源轨道信息，并使用 PyAV 生成 NUT；私有 KVC 解码仍由 Java/unidbg 中的 Android 库执行。
+
+### NUT 里放 rawvideo，FFmpeg 还会显示 rawvideo 解码，这是为什么？
+
+它需要把 rawvideo 包按宽高和像素格式解释成帧，供编码器使用。这不是重新执行 KVC 解码，也不是对像素再进行一次有损解压。
+
+### 能不能让 Java 输出标准 NUT，就去掉 Python？
+
+可以。必须在 Java 一侧增加真实的 NUT 封装实现，或者调用本机封装库。仅仅保留当前 `writeLong(pts)` 和像素写入逻辑，还不构成 NUT。
+
+### 能不能把 native 指针写到管道里？
+
+写一个指针数值只会传输这个整数，不会传输它指向的内存。JVM、Python、FFmpeg 以及模拟器的地址空间含义不同；需要明确的数据复制或专门的共享内存设计。
+
+### PTS 到了 FFmpeg，还需要 `-fps_mode` 吗？
+
+需要明确输出时间策略。输入有时间戳，不代表后续默认同步策略一定不会补帧、丢帧或量化。当前使用 passthrough 并设置编码时间基，再通过输出检查确认结果。
+
+### 为什么不用 `-fps_mode vfr`？
+
+FFmpeg 的 vfr 策略可以为了避免相同时间戳而丢帧。当前选择在桥接层保留全部帧并记录最小时间修正，再使用 passthrough；这是与本任务目标一致的选择。
+
+### Python 增加了一个进程，速度一定更慢吗？
+
+它增加了协议解析、复制和封装开销，但多个阶段也能并行工作。总体速度取决于最慢阶段和资源竞争。当前已经测得整条链路表现，不能只凭语言名称断言瓶颈。要继续优化应分别测量解码、桥接和编码耗时。
+
+### 参考资料
+
+本文的协议、参数和结果以当前项目源码及本机验证为依据。以下官方资料用于解释相关通用概念，不是 KVC 私有格式规范：
+
+- [FFmpeg 命令文档](https://ffmpeg.org/ffmpeg.html)：`copyts`、`fps_mode`、`enc_time_base` 等参数。
+- [FFmpeg 格式文档](https://ffmpeg.org/ffmpeg-formats.html)：rawvideo、NUT、MP4 的输入输出约定。
+- [FFmpeg NUT 文档](https://ffmpeg.org/nut.html)：NUT 和 rawvideo 等媒体类型的相关说明。
+- [PyAV 时间说明](https://pyav.org/docs/stable/api/time.html)：时间整数、time_base 及时间基换算。该页面显示较旧版本的文档，具体行为以本项目验证的 PyAV 15.1.0 为准。
+- [PyAV 容器接口](https://pyav.org/docs/stable/api/container.html)：创建输出流和 mux 等接口。
+
+项目源码：
+
+- [Java 解码与发送代码](/Users/fuchunming/Documents/Codex/2026-11-03/mov-mp4-m4a-3gp-3g2-mj2-6/outputs/kvc-toolkit/unidbg-kvc/src/main/java/xin/chunming/KvcProbe_ffmpeg.java)
+- [Python 桥接代码](/Users/fuchunming/Documents/Codex/2026-11-03/mov-mp4-m4a-3gp-3g2-mj2-6/outputs/kvc-toolkit/unidbg-kvc/pts_bridge.py)
+- [简版运行说明](/Users/fuchunming/Documents/Codex/2026-11-03/mov-mp4-m4a-3gp-3g2-mj2-6/outputs/kvc-toolkit/unidbg-kvc/README-pts-streaming.md)
